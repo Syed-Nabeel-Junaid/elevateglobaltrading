@@ -29,13 +29,9 @@ class CatalogSeederTest extends TestCase
 
     public function test_seeding_produces_the_expected_product_catalog(): void
     {
-        // The real electrical-appliance catalog is populated in a separate
-        // content phase (real models/specs/images researched per category),
-        // not fabricated as placeholder data. Update this count as batches
-        // of real products are added.
         $this->seed();
 
-        $this->assertDatabaseCount('products', 0);
+        $this->assertDatabaseCount('products', 40);
     }
 
     public function test_no_dummy_brands_remain_after_seeding(): void
@@ -58,7 +54,9 @@ class CatalogSeederTest extends TestCase
 
     public function test_at_least_four_products_are_featured(): void
     {
-        $this->markTestSkipped('Pending the real appliance catalog — re-enable once products are seeded.');
+        $this->seed();
+
+        $this->assertGreaterThanOrEqual(4, Product::where('featured', true)->count());
     }
 
     public function test_every_seeded_product_image_exists_on_disk(): void
