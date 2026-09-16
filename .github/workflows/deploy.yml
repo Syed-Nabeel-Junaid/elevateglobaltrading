@@ -1,0 +1,166 @@
+name: Deploy to Hostinger
+
+on:
+  push:
+    branches: [main]
+
+# Prevent overlapping deploys from concurrent pushes; queue instead of cancel
+# so a deploy already in progress is never interrupted mid-way.
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Avoids a network dependency on the shivammathur/setup-php action:
+      # GitHub's ubuntu-latest runner image ships PHP 8.1/8.2/8.3 pre-installed
+      # (via the ondrej/php PPA) with the extensions we need and Composer
+      # already on PATH, so nothing needs to be downloaded at all. This
+      # sidesteps codeload.github.com rate-limiting on the action itself,
+      # which is what broke the build for commit f40f23e (HTTP 429 fetching
+      # shivammathur/setup-php, unrelated to our own dependencies).
+      - name: Select PHP 8.3 (pre-installed on the runner)
+        run: |
+          sudo update-alternatives --set php /usr/bin/php8.3
+          # sqlite3 (distinct from pdo_sqlite) isn't guaranteed enabled by
+          # default on this SAPI — apt pulls from Ubuntu/Azure mirrors, a
+          # different service from codeload.github.com, so this is unaffected
+          # by the rate-limiting this step exists to avoid.
+          sudo apt-get install -y php8.3-sqlite3 >/dev/null
+          php -v
+          composer --version
+
+      - name: Verify required PHP extensions are present
+        run: |
+          required="mbstring pdo pdo_mysql sqlite3 pdo_sqlite xml dom ctype json tokenizer curl fileinfo openssl bcmath filter hash"
+          missing=""
+          for ext in $required; do
+            php -m | grep -qi "^${ext}$" || missing="$missing $ext"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required PHP extensions on the runner:$missing"
+            exit 1
+          fi
+          echo "All required PHP extensions present."
+
+      # Full install (WITH dev dependencies) — the "test" artisan command
+      # only exists when phpunit/phpunit is present, which --no-dev strips.
+      # This was the actual cause of the first two real CI failures: tests
+      # never ran at all because `artisan test` wasn't a registered command.
+      - name: Install Composer dependencies (full, for testing)
+        run: composer install --optimize-autoloader --no-interaction --prefer-dist
+
+      # .env here is a throwaway file for this CI run only — built from the
+      # committed .env.example (no real secrets). Must come after `composer
+      # install`: `artisan` itself needs vendor/autoload.php to boot at all,
+      # so this can't run any earlier. Deleted before packaging so it can
+      # never end up in the deploy artifact.
+      - name: Prepare ephemeral test environment
+        run: |
+          cp .env.example .env
+          php artisan key:generate --force
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build frontend assets (Vite)
+        run: npm run build
+
+      - name: Run test suite
+        run: php artisan test
+
+      - name: Remove ephemeral .env before packaging
+        run: rm -f .env
+
+      # Re-install without dev dependencies now that tests have passed —
+      # this is what actually ships. Fast: Composer's package cache from the
+      # step above means this just re-resolves and re-links, no re-download.
+      - name: Strip dev dependencies for production
+        run: composer install --no-dev --optimize-autoloader --no-interaction --prefer-dist
+
+      - name: Package deploy artifact
+        run: |
+          tar -czf deploy.tar.gz \
+            app bootstrap config database public resources routes vendor artisan composer.json composer.lock
+        # Deliberately excludes storage/ entirely — it's persistent server
+        # state (uploads, logs, framework runtime cache), never CI output.
+
+      - name: Upload deploy artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-package
+          path: deploy.tar.gz
+          retention-days: 1
+
+  deploy:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download deploy artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deploy-package
+
+      - name: Extract artifact
+        run: mkdir -p release && tar -xzf deploy.tar.gz -C release
+
+      # rsync with --delete keeps the server in sync with exactly what's in
+      # this release, EXCEPT the excluded paths below, which rsync leaves
+      # completely untouched (neither overwritten nor deleted) — this is how
+      # .env, admin-uploaded images, the storage symlink, logs, and the root
+      # .htaccess survive every deploy without any special-casing on the
+      # server side.
+      #
+      # /storage/ is excluded wholesale and deliberately: it's never part of
+      # the CI artifact in the first place (see packaging step above), and a
+      # partial exclude list would leave any storage/ subpath it doesn't name
+      # exposed to --delete. bootstrap/cache/*.php is intentionally NOT
+      # excluded — it's generated by the same `composer install` that
+      # produced vendor/, so it must travel with it or the two can drift out
+      # of sync.
+      #
+      # /.htaccess (root-level, NOT public/.htaccess) is server-only — it's
+      # Hostinger's rewrite rule routing all requests into public/, since the
+      # document root can't point directly at Laravel's public/ folder on
+      # this hosting setup. It's not in git, not in the CI tarball, and was
+      # confirmed to exist on the server (Aug 17, 138 bytes, mod_rewrite
+      # redirect into public/). Without this exclusion, --delete would have
+      # removed it on the very first deploy and broken the entire site.
+      - name: Deploy via rsync over SSH
+        uses: easingthemes/ssh-deploy@v6
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.HOSTINGER_SSH_PRIVATE_KEY }}
+          REMOTE_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
+          REMOTE_PORT: ${{ secrets.HOSTINGER_SSH_PORT }}
+          REMOTE_USER: ${{ secrets.HOSTINGER_SSH_USERNAME }}
+          TARGET: ${{ secrets.HOSTINGER_DEPLOY_PATH }}/
+          SOURCE: release/
+          ARGS: '-avzr --delete'
+          EXCLUDE: '/.env, /storage/, /.htaccess'
+
+      - name: Run post-deploy commands on Hostinger
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: ${{ secrets.HOSTINGER_SSH_HOST }}
+          port: ${{ secrets.HOSTINGER_SSH_PORT }}
+          username: ${{ secrets.HOSTINGER_SSH_USERNAME }}
+          key: ${{ secrets.HOSTINGER_SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            cd ${{ secrets.HOSTINGER_DEPLOY_PATH }}
+            php artisan migrate --force
+            php artisan optimize:clear
+            php artisan config:cache
+            php artisan route:cache
+            php artisan view:cache

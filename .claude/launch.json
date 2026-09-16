@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "elevate-global-trading",
+      "runtimeExecutable": "php",
+      "runtimeArgs": ["artisan", "serve", "--port=8124"],
+      "port": 8124
+    },
+    {
+      "name": "elevate-global-trading-vite",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "port": 5174
+    }
+  ]
+}
